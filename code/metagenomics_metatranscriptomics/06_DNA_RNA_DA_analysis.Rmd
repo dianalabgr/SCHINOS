@@ -1,0 +1,326 @@
+---
+title: "Analysis of sequencing data"
+output:
+  word_document: default
+  #pdf_document: default
+  #html_document: default
+params:
+  counts_folder: 
+    value: "/mnt/raid1b/philip/schinos_seq/results/metagenomics/agamemnon_output/final/all"
+  metadata_file:
+    value: "/mnt/raid1b/philip/schinos_seq/metadata/SCHINOS_Sequenced_samples_metadata.tsv"
+  tissue:
+    value: "SB"
+    input: select
+    choices: [SA, SB, SP, GF]
+  sequencing:
+    value: "metagenomics"
+    input: select
+    choices: ["metagenomics", "metatranscriptomics"]
+
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning=FALSE, message=FALSE, out.width="100%", out.height="100%")
+knitr::opts_chunk$set(dpi=260,fig.width=5, fig.height=5)
+counts_folder=params$counts_folder
+patients_file=params$patients_file
+metadata_file=params$metadata_file
+tissue=params$tissue
+sequencing=params$sequencing
+# tissue='SA'
+# sequencing='metagenomics'
+# counts_folder=paste0('/mnt/raid1b/philip/schinos_seq/results/',sequencing,'/agamemnon_output/final/all')
+
+```
+
+# `r if(tissue=="SA"){"Saliva (SA)"}else if(tissue=="SB"){"Subgingival plaque (SB)"}else if(tissue=="SP"){"Supragingival Plaque (SP)"}else if(tissue=="GF"){"Gingival Fluid (GF)"}`, 
+
+# Shotgun `r sequencing` data analysis
+
+```{r basics, echo=FALSE}
+library("phyloseq")
+library("plyr")
+library("dplyr")
+library("vegan")
+library("ggplot2")
+library("stringr")
+library("reshape2")
+library("here")
+library("gridExtra")
+library("ggsci")
+library(RColorBrewer)
+library(MetBrewer)
+library(data.table)
+library(wesanderson)
+```
+
+```{r read_files}
+########### create phylogeny/taxonomy table by copying fom one agamemnon table
+##new metadata
+metadata = read.csv(metadata_file, sep="\t", stringsAsFactors = FALSE)
+rownames(metadata) <- metadata$Sample_name
+metadata$Timepoint=factor(metadata$Timepoint)
+metadata = metadata %>% filter(Discarded==0,na.rm=TRUE)
+if(sequencing=='metatranscriptomics'){
+  metadata = metadata %>% filter(str_detect(Sample_name,"RNA"),na.rm=TRUE)
+}else if (sequencing=='metagenomics'){
+  metadata = metadata %>% filter(str_detect(Sample_name,"DNA"),na.rm=TRUE)
+}
+rownames(metadata) <- metadata$Sample_name
+
+
+i = list.files(counts_folder)[1]
+pd = read.csv(file.path(counts_folder,i), sep = "\t", stringsAsFactors = FALSE)
+#remove the last column, that has the counts
+pd = pd[, -ncol(pd)]
+pd = data.frame(pd)
+rownames(pd) <- pd$TaxID
+
+########### create counts table
+counts_table = sapply(list.files(counts_folder), function(i)
+{
+  #the 10th column has the counts
+  x = read.csv(file.path(counts_folder,i), sep="\t", stringsAsFactors = FALSE)[, 10]
+})
+rownames(counts_table) = rownames(pd)
+#change sample names to remove their unnecessary part
+colnames(counts_table) = gsub("_S.+_", "_", colnames(counts_table))
+colnames(counts_table) = gsub("_filtered\\.tab", "", colnames(counts_table))
+colnames(counts_table) = gsub("_unmapped\\.tab", "", colnames(counts_table))
+
+```
+
+```{r create_phyloseq_object}
+#create the 3 components of the phyloseq object 
+# ids are the taxids
+ids <- dplyr::intersect(row.names(pd), row.names(counts_table))
+
+taxonomy <- pd[ids,]
+taxonomy <- tax_table(as.matrix(taxonomy))
+
+OTUs <- counts_table[ids,]
+OTUs <- otu_table(as.matrix(OTUs), taxa_are_rows = TRUE)
+
+samples = sample_data(metadata[colnames(counts_table),])
+
+#create phyloseq object ps
+ps <- phyloseq(taxonomy, OTUs, samples)
+#remove taxa that are absent in samples 
+ps = prune_taxa(taxa_sums(ps)>0, ps)
+#select only one sample_type
+ps=subset_samples(ps, Sample_type_abbreviation==tissue)
+#create phyloseq object with relative abundances
+ps_rel = ps %>% transform_sample_counts(function(x) {x/sum(x)*100}) 
+
+```
+
+```{r}
+#glom <- tax_glom(ps, taxrank = 'Species')
+#table_to_print = otu_table(ps)
+#table_to_print[,"name"] = tax_table(ps)[,"Species"]
+
+
+```
+
+## Microbial total reads per sample
+
+```{r plot1, echo=FALSE, out.width="100%"}
+otutable=otu_table(ps) 
+otutable=as.data.frame(otutable)
+depth=colSums(otutable)
+depth=sort(depth)
+#kable(depth)
+par(mar=c(7,4,4,0))
+plot(depth,  ylab="Counts sum", xlab="", xaxt="n", yaxt="n", yaxp=c(1000000,31000000,15))
+#axis(1,at=1:21, labels=rownames(otutable), srt=-35, cex=1.2)
+text(x = 1:length(depth),
+     labels = gsub("RNA|DNA","", names(depth)),
+     xpd = NA,
+     ## Rotate the labels by 90 degrees.
+     srt = 90,
+     cex = 0.9,
+     adj = 1.2)
+axis(side = 2,
+     ## Rotate the labels.
+     las = 2,
+     ## Adjust the label position.
+     #mgp = c(3, 0.75, 0)
+     )
+grid(nx = NULL, ny = NULL,
+     lty = 2,      # Grid line type
+     col = "gray", # Grid line color
+     lwd = 2)      # Grid line width
+
+
+```
+```{r rarefaction curves, out.width='100%'}
+colors <- rep(c(brewer.pal(12, "Set3"), brewer.pal(9, "Set1")),4)
+pch = 15
+otus_a <- round(otu_table(ps))
+class(otus_a) <- "matrix"
+# transpose observations to rows
+otus_a <- t(otus_a)
+rownames(otus_a) = gsub("DNA","",rownames(otus_a))
+# png(filename=paste0(output_folder,"/rarecurves_",tissue,".png"), width = 680, height = 580, units = "px")
+rarecurve(otus_a, step=100000, lwd=2,  label=F, col = colors[as.numeric(factor(row.names(otus_a)))])
+legend("bottomright", inset=c(0,0), ncol=3, xpd = TRUE, legend=levels(factor(rownames(otus_a))),
+       pch = pch, col= colors[as.numeric(factor(row.names(otus_a)))],cex=0.9)
+title(paste0(tissue, " samples"))
+#dev.off()
+```
+
+```{r rarefy}
+otutable=otu_table(ps) 
+otutable=as.data.frame(otutable)
+otutable = t(otutable)
+otutable=round(otutable)
+otutable = otutable[order(row.names(otutable)),]
+
+raremax <- min(rowSums(otutable))
+set.seed(1)
+ps_rarefied = rarefy_even_depth(ps, sample.size = raremax)
+ps_rarefied_rel = ps_rarefied %>% transform_sample_counts(function(x) {x/sum(x)*100}) 
+```
+\newpage
+# Microbial Composition
+## Top 15 most abundant Species,
+by summing their relative abundance across all samples.
+```{r, dpi=260, fig.width=7, fig.height=10}
+ps_modified=ps_rel
+topotus = names(sort(taxa_sums(ps_modified), TRUE)[1:15])
+taxtabtop = cbind(tax_table(ps_modified), top_taxa = 'Other Species')
+taxtabtop[topotus, "top_taxa"] <- as(tax_table(ps_modified)[topotus, "Species"], "character")
+tax_table(ps_modified) <- tax_table(taxtabtop)
+title = paste0("Composition barplot at Species level, top 15 Species colored, in ", tissue, " samples.")
+plot_bar(ps_modified, "Sample_name", fill = "top_taxa", title = title) +
+  coord_flip() + 
+  facet_wrap(Mastic_product~Patient_id, scales="free", dir = "h", strip.position="left",ncol=1, labeller=function(x) {x[1]}) +
+  theme(axis.text.x=element_blank()) + #remove x axis labels
+  theme(strip.text.y.left = element_text(size = rel(1), angle=0))  +
+  xlab('Patient_Type_Day') + 
+  ylab('%Abundance')
+```
+
+# Known oral pathogens
+```{r pathogens_plot, dpi=260, fig.width=7, fig.height=10}
+ps_modified=ps_rel
+pathogens_ids=rownames(tax_table(subset_taxa(ps_modified, Species%in%c(
+                                              "Porphyromonas gingivalis",
+                                              "Treponema denticola",
+                                              "Tannerella forsythia",
+                                              "Prevotella intermedia",
+                                              "Bacteroides forsythias",
+                                              "Campylobacter rectus",
+                                              "Eubacterium datum",
+                                              "Filifactor alocis",
+                                              "Peptostreptococcus micros",
+                                              "Streptococcus intermedius",
+                                              "Aggregatibacter actinomycetemcomitans",
+                                              "Fusobacterium nucleatum",
+                                              "Campylobacter rectus",
+                                              "Eikenella corrodens",
+                                              "Parvimonas micra"
+                                              ))))
+
+taxtab_pathogens = cbind(tax_table(ps_modified), Pathogenic_Species = NA)
+taxtab_pathogens[pathogens_ids, "Pathogenic_Species"] <- taxtab_pathogens[pathogens_ids, "Species"] 
+tax_table(ps_modified) <- tax_table(taxtab_pathogens)
+
+title = paste0("Known Oral Pathogens in ", tissue, " samples")
+
+plot_bar(ps_modified, "Sample_name", fill = "Pathogenic_Species", title = title) +
+  coord_flip() + 
+  facet_wrap(Mastic_product~Patient_id, scales="free", dir = "h", strip.position="left",ncol=1, labeller=function(x) {x[1]}) +
+  theme(axis.text.x=element_blank()) + #remove x axis labels
+  theme(strip.text.y.left = element_text(size = rel(1), angle=0))  +
+  xlab('Patient_Type_Day') + 
+  ylab('%Abundance')
+```
+
+```{r pg, dpi=260, fig.width=3, fig.height=2}
+# ps_with_only_PorGin <- subset_taxa(ps_modified, Species == "Porphyromonas gingivalis")
+# ps_with_only_PorGin <- subset_samples(ps_with_only_PorGin, Mastic_product == "Mastic gum")
+# ps_with_only_PorGin <- subset_samples(ps_with_only_PorGin, Timepoint != "2")
+# 
+# 
+# plot_bar(ps_with_only_PorGin, x="Sample_name", fill = "Timepoint", title = title) +
+#   coord_flip() + 
+#   facet_wrap(~Patient_id, scales="free", dir = "v", strip.position="left",ncol=1, labeller=function(x) {x[1]}) +
+#   theme(axis.text.x=element_blank()) + #remove x axis labels
+#   theme(strip.text.y.left = element_text(size = rel(1), angle=0))  +
+#   xlab('Patient_Type_Day') + 
+#   ylab('%Abundance')
+
+```
+\newpage
+
+## Alpha diversity, on rarefied data
+
+```{r richness}
+#alpha_meas = c("Observed", "Chao1", "ACE", "Shannon", "Simpson", "InvSimpson", "Fisher")
+alpha_meas = c("Shannon", "Simpson")
+
+p <- plot_richness(ps_rarefied, x="Timepoint", color="Mastic_product", measures=alpha_meas) 
+my_palette=c("darkgrey","#4588e6","#67ab43")
+names(my_palette)=c("Placebo gum","Mastic gum","Mastic oil")
+p2 = ggplot(data=p$data, aes(x=factor(Timepoint), y=value, color=Mastic_product))  + 
+    geom_boxplot() + 
+    scale_color_manual(breaks = c("Mastic gum","Mastic oil","Placebo gum"), values=my_palette) +
+geom_point(position=position_dodge(width=0.75),aes(color=Mastic_product)) + 
+facet_wrap(~ variable, scales = "free") +
+  labs(title = "Figure: Alpha diversity plots",
+       subtitle = "",
+       y = "Measure", x = "Timepoint") 
+p2
+
+```
+
+## Beta diversity, on rarefied data
+
+```{r dimensional_reduction}
+title = "Figure: PCoA of Bray-Curtis distance, Timepoints: 1,2,3"
+ps_ord = ordinate(ps_rarefied, "PCoA", "bray")
+p = plot_ordination(ps_rarefied, ps_ord, color = "Patient_id", shape = "Mastic_product", label="Timepoint")
+p = p + geom_point(size = 3, alpha = 0.7) + ggtitle(title)
+p
+
+
+title = "Figure: PCoA of Bray-Curtis distance, Timepoints: 1,2,3"
+ps_ord = ordinate(ps_rarefied, "PCoA", "bray")
+p = plot_ordination(ps_rarefied, ps_ord, color = "Batch", shape = "Mastic_product", label="Timepoint")
+p = p + geom_point(size = 3, alpha = 0.7) + ggtitle(title)
+p
+```
+
+```{r}
+# future annalysis:
+# ANOVA on alpha diiversity
+# permanova on bray curtis
+# Sparse Partial Least Squares regression - discriminant analysis (sPLS-DA)  a multivariate method to identify microbial drivers discriminating phenotype groups   https://www.sciencedirect.com/science/article/pii/S2589004221016576?via%3Dihub
+
+#timeOmics
+
+ 
+```
+
+```{r differential_abundance_analysis}
+#
+library("DESeq2")
+
+kostic = subset_samples(ps, Mastic_product == "Mastic gum")
+kostic = subset_samples(kostic, Timepoint !=2)
+#kostic@sam_data %>% mutate(factor
+
+# diagdds = phyloseq_to_deseq2(kostic, ~ factor(Timepoint))
+# diagdds = DESeq(diagdds, test="Wald", fitType="parametric")
+# 
+# res = results(diagdds, cooksCutoff = FALSE)
+# alpha = 0.01
+# sigtab = res[which(res$padj < alpha), ]
+# sigtab = cbind(as(sigtab, "data.frame"), as(tax_table(kostic)[rownames(sigtab), ], "matrix"))
+# head(sigtab)
+#Lambdavirus lambda	Escherichia phage Lambda
+
+```

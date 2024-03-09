@@ -1,0 +1,171 @@
+---
+title: "Create abundance tables "
+output:
+  pdf_document: default
+  html_document: default
+params:
+  counts_folder: 
+    value: "/mnt/raid1b/philip/schinos_seq/results/metatranscriptomics/agamemnon_output/final/all"
+  patients_file:
+    value: "/mnt/raid1b/philip/schinos_seq/metadata/SCHINOS_Patients.tsv"
+  metadata_file:
+    value: "/mnt/raid1b/philip/schinos_seq/metadata/SCHINOS_Sequenced_samples_metadata.tsv"
+  sequencing:
+    value: "metatranscriptomics"
+    input: select
+    choices: ["metagenomics", "metatranscriptomics"]
+  output_folder: 
+    value: "/mnt/raid1b/philip/schinos_seq/results/metatranscriptomics/abundances"
+---
+```{r setup, include=FALSE}
+#tinytex::install_tinytex()
+knitr::opts_chunk$set(echo = FALSE, warning=FALSE, message=FALSE, out.width="100%", out.height="100%")
+counts_folder=params$counts_folder
+output_folder = params$output_folder
+#patients_file=params$patients_file
+metadata_file=params$metadata_file
+sequencing=params$sequencing
+# sequencing="metagenomics"
+# counts_folder="/mnt/raid1b/philip/schinos_seq/results/metagenomics/agamemnon_output/final/all"
+# output_folder="/mnt/raid1b/philip/schinos_seq/results/metagenomics/abundances"
+```
+# Shotgun `r sequencing` data analysis
+```{r basics, echo=FALSE}
+#setwd(path)
+#library("Biobase")
+#library("metagenomeSeq")
+#BiocManager::install("phyloseq")
+library("phyloseq")
+library("plyr")
+library("dplyr")
+library("vegan")
+library("ggplot2")
+library("stringr")
+library("reshape2")
+library("here")
+library("gridExtra")
+library(RColorBrewer)
+# BiocManager::install("speedyseq")
+# devtools::install_github("mikemc/speedyseq")
+```
+
+
+```{r read_files}
+########### create phylogeny/taxonomy table by copying from one agamemnon table
+i = list.files(counts_folder)[2]
+pd = read.csv(file.path(counts_folder,i), sep = "\t", stringsAsFactors = FALSE)
+#remove the last column, that has the counts
+pd = pd[, -ncol(pd)]
+pd = data.frame(pd)
+rownames(pd) <- pd$TaxID
+
+########### create counts table
+counts_table = sapply(list.files(counts_folder), function(i)
+{
+  #the 10th column has the counts
+  x = read.csv(file.path(counts_folder,i), sep="\t", stringsAsFactors = FALSE)[, 10]
+})
+ncol(counts_table)
+rownames(counts_table) = rownames(pd)
+#change sample names to remove their unnecessary part
+colnames(counts_table) = gsub("_S.*_filtered\\.tab", "", colnames(counts_table))
+colnames(counts_table) = gsub("_filtered\\.tab", "", colnames(counts_table))
+colnames(counts_table) = gsub("_S.*_unmapped\\.tab", "", colnames(counts_table))
+colnames(counts_table) = gsub("_unmapped\\.tab", "", colnames(counts_table))
+
+########### create metadata table
+metadata = read.csv(metadata_file, sep="\t", stringsAsFactors = FALSE)
+rownames(metadata) <- metadata$Sample_name
+metadata$Timepoint=factor(metadata$Timepoint)
+metadata = metadata %>% filter(Discarded==0,na.rm=TRUE)
+if(sequencing=='metatranscriptomics'){
+  metadata = metadata %>% filter(str_detect(Sample_name,"RNA"),na.rm=TRUE)
+}else if (sequencing=='metagenomics'){
+  metadata = metadata %>% filter(str_detect(Sample_name,"DNA"),na.rm=TRUE)
+}
+rownames(metadata) <- metadata$Sample_name
+```
+
+```{r create_phyloseq_object}
+#create the 3 components of the phyloseq object 
+# ids are taxa ids
+ids <- dplyr::intersect(row.names(pd), row.names(counts_table))
+taxonomy <- pd[ids,]
+taxonomy <- tax_table(as.matrix(taxonomy))
+
+OTUs <- counts_table[ids,rownames(metadata)]
+OTUs <- otu_table(as.matrix(OTUs), taxa_are_rows = TRUE)
+
+samples = sample_data(metadata)
+
+#create phyloseq object ps
+ps <- phyloseq(taxonomy, OTUs, samples)
+
+#remove taxa that are absent in samples 
+ps = prune_taxa(taxa_sums(ps)>0, ps)
+
+#select only one sample_type
+#ps=subset_samples(ps, Tissue==tissue)
+
+#create phyloseq object with relative abundances
+ps_rel = ps %>% transform_sample_counts(function(x) {x/sum(x)*100}) 
+
+# plot.new()
+# dev.new()
+if(sequencing=="metagenomics"){
+  tissues =    c('SA','SB','SP', 'GF')
+}else{
+    tissues =    c('SB','SP')
+}
+   
+for (tissue in tissues){
+
+  colors <- rep(c(brewer.pal(12, "Set3"), brewer.pal(9, "Set1")),4)
+  pch = 15
+  psSA=subset_samples(ps, Sample_type_abbreviation==tissue)
+  tab <- round(otu_table(psSA))
+  class(tab) <- "matrix" 
+  # transpose observations to rows
+  tab <- t(tab)
+  rownames(tab) = gsub("DNA","",rownames(tab))
+  png(filename=paste0(output_folder,"/rarecurves_",tissue,".png"), width = 680, height = 580, units = "px")
+  rare <- rarecurve(tab, step=100000, lwd=2,  label=F, col = colors[as.numeric(factor(row.names(tab)))])
+  legend("bottomright", inset=c(0,0), ncol=3, xpd = TRUE, legend=levels(factor(rownames(tab))), 
+         pch = pch, col= colors[as.numeric(factor(row.names(tab)))],cex=0.9)
+  title(paste0(tissue, " samples"))
+  dev.off()
+  
+}
+#set.seed(111) # keep result reproductive
+#ps.rarefied = rarefy_even_depth(ps, rngseed=1, sample.size=1103, replace=F)
+```
+
+```{r save_tables}
+glom <- tax_glom(ps, taxrank = 'Species')
+table_to_print = as.data.frame(otu_table(glom))
+table_to_print = tibble::rownames_to_column(table_to_print, var="Name")
+table_to_print = table_to_print %>% mutate(Name = tax_table(glom)[Name,"Species"]) 
+write.table(table_to_print, file=file.path(output_folder,paste0(sequencing,"_abundances.tsv")), sep="\t", quote=FALSE, row.names = FALSE)
+
+
+sb_table = select(table_to_print,c(1, matches(".*SB.*")))
+write.table(sb_table, file=file.path(output_folder,paste0(sequencing,"_abundances_SB.tsv")), sep="\t", quote=FALSE, row.names = FALSE)
+
+sp_table = select(table_to_print,c(1, matches(".*SP.*")))
+write.table(sp_table, file=file.path(output_folder,paste0(sequencing,"_abundances_SP.tsv")), sep="\t", quote=FALSE, row.names = FALSE)
+
+depths = colSums(table_to_print[,-1])
+
+depths['S9SP00DNA']
+
+min(depths)
+sort(depths)
+
+View(depths)
+relative_abundances = glom <- tax_glom(ps_rel, taxrank = 'Species')
+relative_abundances = as.data.frame(otu_table(glom))
+relative_abundances = tibble::rownames_to_column(relative_abundances, var="Name")
+relative_abundances = relative_abundances %>% mutate(Name = tax_table(glom)[Name,"Species"]) 
+write.table(relative_abundances, file=file.path(output_folder,paste0(sequencing,"_rel_abundances.tsv")), sep="\t", quote=FALSE, row.names = FALSE)
+
+```

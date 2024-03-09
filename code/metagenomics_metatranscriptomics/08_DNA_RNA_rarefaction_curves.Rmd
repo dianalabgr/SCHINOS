@@ -1,0 +1,209 @@
+---
+title: "Analysis of sequencing data"
+output:
+  word_document: default
+  #pdf_document: default
+  #html_document: default
+params:
+  counts_folder: 
+    value: "/mnt/raid1b/philip/schinos_seq/results/metagenomics/agamemnon_output/final/all"
+  metadata_file:
+    value: "/mnt/raid1b/philip/schinos_seq/metadata/SCHINOS_Sequenced_samples_metadata.tsv"
+  tissue:
+    value: "SB"
+    input: select
+    choices: [SA, SB, SP, GF]
+  sequencing:
+    value: "metagenomics"
+    input: select
+    choices: ["metagenomics", "metatranscriptomics"]
+
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning=FALSE, message=FALSE, out.width="100%", out.height="100%")
+knitr::opts_chunk$set(dpi=260,fig.width=5, fig.height=5)
+counts_folder=params$counts_folder
+patients_file=params$patients_file
+metadata_file=params$metadata_file
+tissue=params$tissue
+sequencing=params$sequencing
+# tissue='SA'
+# sequencing='metagenomics'
+# counts_folder=paste0('/mnt/raid1b/philip/schinos_seq/results/',sequencing,'/agamemnon_output/final/all')
+
+```
+
+# `r if(tissue=="SA"){"Saliva (SA)"}else if(tissue=="SB"){"Subgingival plaque (SB)"}else if(tissue=="SP"){"Supragingival Plaque (SP)"}else if(tissue=="GF"){"Gingival Fluid (GF)"}`, 
+
+# Shotgun `r sequencing` data analysis
+
+```{r basics, echo=FALSE}
+library("phyloseq")
+library("plyr")
+library("dplyr")
+library("vegan")
+library("ggplot2")
+library("stringr")
+library("reshape2")
+library("here")
+library("gridExtra")
+library("ggsci")
+library(RColorBrewer)
+library(MetBrewer)
+library(data.table)
+library(wesanderson)
+```
+```{r read_files}
+########### create phylogeny/taxonomy table by copying fom one agamemnon table
+##new metadata
+metadata = read.csv(metadata_file, sep="\t", stringsAsFactors = FALSE)
+rownames(metadata) <- metadata$Sample_name
+metadata$Timepoint=factor(metadata$Timepoint)
+metadata = metadata %>% filter(Discarded==0,na.rm=TRUE)
+if(sequencing=='metatranscriptomics'){
+  metadata = metadata %>% filter(str_detect(Sample_name,"RNA"),na.rm=TRUE)
+}else if (sequencing=='metagenomics'){
+  metadata = metadata %>% filter(str_detect(Sample_name,"DNA"),na.rm=TRUE)
+}
+rownames(metadata) <- metadata$Sample_name
+
+
+i = list.files(counts_folder)[1]
+pd = read.csv(file.path(counts_folder,i), sep = "\t", stringsAsFactors = FALSE)
+#remove the last column, that has the counts
+pd = pd[, -ncol(pd)]
+pd = data.frame(pd)
+rownames(pd) <- pd$TaxID
+
+########### create counts table from samples
+counts_table = sapply(list.files(counts_folder), function(i)
+{
+  #the 10th column has the counts
+  x = read.csv(file.path(counts_folder,i), sep="\t", stringsAsFactors = FALSE)[, 10]
+})
+rownames(counts_table) = rownames(pd)
+#change sample names to remove their unnecessary part
+colnames(counts_table) = gsub("_S.+_", "_", colnames(counts_table))
+colnames(counts_table) = gsub("_filtered\\.tab", "", colnames(counts_table))
+colnames(counts_table) = gsub("_unmapped\\.tab", "", colnames(counts_table))
+
+```
+
+```{r create_phyloseq_object}
+#create the 3 components of the phyloseq object 
+# ids are the taxids
+ids <- dplyr::intersect(row.names(pd), row.names(counts_table))
+
+taxonomy <- pd[ids,]
+taxonomy <- tax_table(as.matrix(taxonomy))
+
+OTUs <- counts_table[ids,]
+OTUs <- otu_table(as.matrix(OTUs), taxa_are_rows = TRUE)
+
+samples = sample_data(metadata[colnames(counts_table),])
+
+#create phyloseq object ps
+ps <- phyloseq(taxonomy, OTUs, samples)
+#remove taxa that are absent in samples 
+ps = prune_taxa(taxa_sums(ps)>0, ps)
+#select only one sample_type
+ps=subset_samples(ps, Sample_type_abbreviation==tissue)
+#create phyloseq object with relative abundances
+ps_rel = ps %>% transform_sample_counts(function(x) {x/sum(x)*100}) 
+
+```
+
+
+```{r rarefaction curves}
+output_folder = paste0("/mnt/raid1b/philip/schinos_seq/results/",sequencing,"/rarefaction_curves")
+colors <- rep(c(brewer.pal(12, "Set3"), brewer.pal(9, "Set1")),4)
+pch = 15
+otus_a <- round(otu_table(ps))
+class(otus_a) <- "matrix"
+# transpose observations to rows
+otus_a <- t(otus_a)
+rownames(otus_a) = gsub("DNA","",rownames(otus_a))
+png(filename=paste0(output_folder,"/rarecurves_",tissue,".png"), width = 680, height = 580, units = "px")
+rarecurve(otus_a, step=100000, lwd=2,  label=F, col = colors[as.numeric(factor(row.names(otus_a)))])
+legend("bottomright", inset=c(0,0), ncol=3, xpd = TRUE, legend=levels(factor(rownames(otus_a))),
+       pch = pch, col= colors[as.numeric(factor(row.names(otus_a)))],cex=0.9)
+title(paste0(tissue, " samples"))
+dev.off()
+
+```
+
+```{r rarefaction_curves}
+set.seed(42)
+psdata = ps
+calculate_rarefaction_curves <- function(psdata, measures, depths) {
+  require('plyr') # ldply
+  require('reshape2') # melt
+
+  estimate_rarified_richness <- function(psdata, measures, depth) {
+    if(max(sample_sums(psdata)) < depth) return()
+    psdata <- prune_samples(sample_sums(psdata) >= depth, psdata)
+
+    rarified_psdata <- rarefy_even_depth(psdata, depth, verbose = FALSE)
+
+    alpha_diversity <- estimate_richness(rarified_psdata, measures = measures)
+
+    # as.matrix forces the use of melt.array, which includes the Sample names (rownames)
+    molten_alpha_diversity <- melt(as.matrix(alpha_diversity), varnames = c('Sample', 'Measure'), value.name = 'Alpha_diversity')
+
+    molten_alpha_diversity
+  }
+
+  names(depths) <- depths # this enables automatic addition of the Depth to the output by ldply
+  rarefaction_curve_data <- ldply(depths, estimate_rarified_richness, psdata = psdata, measures = measures, .id = 'Depth', .progress = ifelse(interactive(), 'text', 'none'))
+
+  # convert Depth from factor to numeric
+  rarefaction_curve_data$Depth <- as.numeric(levels(rarefaction_curve_data$Depth))[rarefaction_curve_data$Depth]
+
+  rarefaction_curve_data
+}
+
+rarefaction_curve_data <- calculate_rarefaction_curves(ps, c('Shannon'), rep(c(10, 100, 500, 1000, 10000, 50000, 100000, 1:3 * 200000), each = 5))
+summary(rarefaction_curve_data)
+```
+```{r rarefy}
+otutable=otu_table(ps) 
+otutable=as.data.frame(otutable)
+otutable = t(otutable)
+otutable=round(otutable)
+otutable = otutable[order(row.names(otutable)),]
+
+raremax <- min(rowSums(otutable))
+set.seed(1)
+ps_rarefied = rarefy_even_depth(ps, sample.size = raremax)
+ps_rarefied_rel = ps_rarefied %>% transform_sample_counts(function(x) {x/sum(x)*100}) 
+rarefaction_curve_data_summary <- ddply(rarefaction_curve_data, c('Depth', 'Sample', 'Measure'), summarise, Alpha_diversity_mean = mean(Alpha_diversity), Alpha_diversity_sd = sd(Alpha_diversity))
+rarefaction_curve_data_summary_verbose <- merge(rarefaction_curve_data_summary, data.frame(sample_data(psdata)), by.x = 'Sample', by.y = 'row.names')
+rarefaction_curve_data_summary_verbose$Timepoint = c("Day 0","Day 07","Day 21")[as.numeric(rarefaction_curve_data_summary_verbose$Timepoint)]
+```
+#Shannon diversity index rarefaction curves
+```{r}
+#library('ggplot2')
+ggplot(
+  data = rarefaction_curve_data_summary_verbose,
+  mapping = aes(
+    x = Depth/1000,
+    y = Alpha_diversity_mean,
+    ymin = Alpha_diversity_mean - Alpha_diversity_sd,
+    ymax = Alpha_diversity_mean + Alpha_diversity_sd,
+    colour = Patient_id,
+    group = Sample_name
+  )
+) + geom_line(
+) + geom_pointrange(
+) + facet_wrap(
+  facets = ~ Timepoint
+  #,  scales = 'free_y'
+#) + theme(legend.position = 'none'
+) + xlim(0,100
+) + ggtitle(paste0(tissue," samples, per Timepoint")
+) +xlab("Library depth in Thousands")
+
+
+```

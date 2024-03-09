@@ -1,0 +1,216 @@
+---
+title: "mrna_counts_analysis"
+output:
+  word_document: default
+  html_document:
+    df_print: paged
+    fig_caption: yes
+    self_contained: no
+params:
+  output_folder: 
+    value: "/mnt/raid1/philip/schinos_seq/results/mrna"
+date: '2024-02-23'
+---
+
+```{r setup, include=FALSE}
+#rm(list = ls())
+knitr::opts_chunk$set(echo = FALSE, warning=FALSE, message=FALSE, out.width="100%", out.height="100%")
+knitr::opts_chunk$set(dpi=400,fig.width=9, fig.height=9)
+output_folder = params$output_folder
+
+```
+
+# mrna analysis, SCHINOS {.tabset .tabset-fade .tabset-pills}
+
+```{r libraries}
+library(edgeR)
+# BiocManager::install("tximportData")
+library(tximportData)
+library(tximport)
+library(dplyr)
+library(stringr)
+library(RColorBrewer)
+library(readxl)
+library(org.Hs.eg.db)
+library(ggplot2)
+library(knitr)
+```
+```{r read_files}
+#read tissue (TI) counts
+
+dir <- "/mnt/raid1/philip/schinos_seq/data/mrna/mapped_to_genes"
+files = list.files(dir)[grepl("TI.*ReadsPerGene", list.files(dir))]
+names(files) <- gsub("_S.*ReadsPerGene.*","",files)
+files_paths=file.path(dir,files)
+names(files_paths) <- names(files)
+
+
+######read gene counts from STAR
+counts_table = sapply(files_paths, function(i)
+{
+  #the 10th column has the counts
+  x = read.csv(i, sep="\t", stringsAsFactors = FALSE, header = FALSE, skip=4)[, 4]
+})
+rownames(counts_table) = rownames(read.csv(files_paths[1], sep="\t", stringsAsFactors = FALSE, header = FALSE, row.names = 1, skip=4))
+
+depth = colSums(counts_table)
+# #re-arrange order of samples
+depth=sort(depth, decreasing=TRUE)
+depth = depth[c(grep("TI", names(depth)),grep("GF", names(depth)))]
+#PLOT
+barplot(depth/1e06, names=colnames(depth),las=2, cex.names = 0.75); grid()
+mtext(side = 2, text = "Library size (millions)", line = 3)
+title("Barplot of sum of gene counts")
+```
+```{r read_metadata}
+metadata_file="/mnt/raid1b/philip/schinos_seq/metadata/SCHINOS_Sequenced_samples_metadata.tsv"
+metadata = read.csv(metadata_file, sep="\t", stringsAsFactors = FALSE)
+rownames(metadata) <- metadata$Sample_name
+metadata$Timepoint=factor(metadata$Timepoint)
+metadata$Mastic_product=relevel(factor(metadata$Mastic_product),"Placebo gum")
+metadata = metadata %>% filter(Discarded==0,na.rm=TRUE)
+metadata = metadata %>% filter(str_detect(Sample_name,"MRN"),na.rm=TRUE)
+metadata$Batch=factor(metadata$Batch)
+#change order of metadata rows to match files list
+metadata=metadata[match(names(files_paths),metadata$Sample_name),]
+```
+
+```{r load_into_DGEList}
+y <- DGEList(counts_table, group = metadata$Mastic_product)
+y$samples=merge(y$samples,metadata, by="row.names")
+#annotate gene ids
+gene_info=as.data.frame ( read.table(file = "/mnt/raid1b/philip/Homo_sapiens/STAR_index/geneInfo.tab", header=F, skip=1, sep="\t"))
+colnames(gene_info) = c("ENSEMBL","SYMBOL","GENETYPE")
+gene_info$GENENAME = mapIds(org.Hs.eg.db, keys=gene_info$ENSEMBL,
+                   keytype="ENSEMBL", column="GENENAME")
+geneids=data.frame(ENSEMBL = rownames(y) )
+y$genes = inner_join(geneids, gene_info, by="ENSEMBL")
+
+```
+
+## Plots
+```{r plot_before_filtering_genes, fig.height=4}
+L <- mean(y$samples$lib.size) * 1e-6
+M <- median(y$samples$lib.size) * 1e-6
+
+# 2.925283 2.511230
+cpm <- cpm(y)
+lcpm <- cpm(y, log=TRUE)  #lcpm is calculated as log2(cpm +2/L) to ensure non-zeroes
+col <- c(brewer.pal(12, "Paired"),brewer.pal(12, "Set2"))
+boxplot(lcpm, las=2, col=col, main="", cex=0.7, cex.axis=0.6)
+title(main="A. Unnormalised unfiltered data (expressed in log-CPM)", ylab="Log-cpm")
+```
+
+```{r plot_gene_expression}
+#choose minimum cutoff
+counts.cutoff = 5
+lcpm.cutoff <- log2(counts.cutoff/M + 2/L)
+##### because lcpm = log2(rawcount/M +2/L)
+
+nsamples <- ncol(y)
+samplenames=colnames(y)
+
+#par(mfrow=c(1,2))
+plot(density(lcpm[,1]), col=col[1], lwd=2, ylim=c(0,0.26), las=2, main="", xlab="")
+title(main="Raw data", xlab="Log-cpm")
+abline(v=lcpm.cutoff, lty=3)
+for (i in 2:nsamples){
+  den <- density(lcpm[,i])
+  lines(den$x, den$y, col=col[i], lwd=2)
+}
+legend("topright", samplenames, text.col=col, bty="n",ncol=2, cex=1)
+
+```
+
+## Filtering and normalisation
+
+```{r filtering_and_plot}
+y$samples$Batch = factor(y$samples$Batch)
+libsizes = y$samples$lib.size
+#keep samples with depth >=1 million
+#y = y[,which(y$samples$lib.size>1000000)]   
+#keep genes that are present in at least 18 samples with at least 10 reads
+keep.exprs <- filterByExpr(y, group=y$samples$group, min.count=counts.cutoff, large.n=18, min.prop=1)
+y <- y[keep.exprs,, keep.lib.sizes=FALSE]   #change to FALSE
+#dim(y)
+lcpm <- cpm(y, log=TRUE)
+nsamples <- ncol(y)
+samplenames=colnames(y)
+plot(density(lcpm[,1]), col=col[1], lwd=2, ylim=c(0,0.26), las=2, main="", xlab="")
+title(main="B. Filtered data", xlab="Log-cpm")
+abline(v=lcpm.cutoff, lty=3)
+for (i in 2:nsamples){
+  den <- density(lcpm[,i])
+  lines(den$x, den$y, col=col[i], lwd=2)
+}
+legend("topright", samplenames, text.col=col, bty="n", ncol=2,cex=0.8)
+
+```
+```{r Normalising_gene_expression_distributions, fig.height=4}
+#y$samples$norm.factors
+#par(mfrow=c(1,2))
+lcpm <- cpm(y, log=TRUE)
+#png(filename=file.path(output_folder,"plots","B. Unnormalised filtered data"),)
+bp = boxplot(lcpm, las=2, col=col, main="", cex=0.7, cex.axis=0.6)
+title(main="B. Unnormalised filtered data", ylab="Log-cpm")
+#dev.off()
+
+y <- calcNormFactors(y, method = "TMM")
+lcpm <- cpm(y, log=TRUE)
+#png(filename=file.path(output_folder,"plots","C. Normalised filtered data.png"))
+bp = boxplot(lcpm, las=2, col=col, main="", cex=0.7, cex.axis=0.6, fig.height=1)
+title(main="C. Normalised filtered data", ylab="Log-cpm")
+#dev.off()
+
+```
+
+```{r plot_MDS_and_then_fit, out.width='50%'}
+#exploring differences between libraries MDS plot
+pch <- c(15,16,17)
+colors=c("darkgrey","#4588e6","#67ab43")
+plotMDS(y, pch = as.numeric(y$samples$Mastic_product), col=colors[as.numeric(y$samples$Mastic_product)], labels =gsub("MRN","",y$samples$Sample_name), cex=0.8)
+legend("topright", legend=levels(y$samples$group), pch = pch, col= colors[c(1:nlevels(y$samples$Mastic_product))],cex=1)
+title("All TI samples")
+
+###day 0
+y_filtered = y[,which(y$samples$Timepoint == 1)]
+plotMDS(y_filtered , pch = as.numeric(y_filtered$samples$Mastic_product), col=colors[as.numeric(y_filtered$samples$Mastic_product)], labels =gsub("MRN","",y_filtered$samples$Sample_name), cex=1)
+legend("topleft", legend=levels(y_filtered$samples$group), pch = pch, col= colors[c(1:nlevels(y_filtered$samples$Mastic_product))],cex=1)
+title("All Day 0 samples")
+
+y_pg=y[,which(y$samples$Mastic_product=="Placebo gum")]   
+y_mg=y[,which(y$samples$Mastic_product=="Mastic gum")]   
+y_mo=y[,which(y$samples$Mastic_product=="Mastic oil")] 
+
+for(group in c("all", "Placebo gum", "Mastic gum", "Mastic oil")){
+  pch = 15
+  if ( group == "all") {
+    y_filtered = y
+  }else{
+      y_filtered=y[,which(y$samples$Mastic_product==group)] 
+  }
+  par(mar=c(5,5,5,7))
+  colors=c("darkred","red","orange")
+  plotMDS(y_filtered , pch=pch, col=colors[as.numeric(y_filtered$samples$Timepoint)], labels =gsub("MRN","",y_filtered$samples$Sample_name), cex=1.1)
+  legend("topright", inset=c(-0,0), xpd = TRUE, legend=paste0("Timepoint ", levels(y_filtered$samples$Timepoint)), pch = pch, col= colors[c(1:nlevels(y_filtered$samples$Timepoint))],cex=1.1)
+  title(paste0(group," Patients"))
+}
+
+#plot batch effect
+y_filtered= y
+pch=15
+colors = c("red","green","blue","orange")
+plotMDS(y_filtered , pch = as.numeric(y_filtered$samples$Mastic_product), col=colors[as.numeric(y_filtered$samples$Batch)], labels =gsub("MRN","",y_filtered$samples$Sample_name), cex=1)
+legend("topleft", legend=paste0("Batch ",levels(y_filtered$samples$Batch)), pch = pch, col= colors[c(1:nlevels(y_filtered$samples$Batch))],cex=1)
+title("All samples")
+
+
+# plotBCV(y)
+# design <- model.matrix(~0+y$samples$Timepoint)
+# colnames(design) <- gsub("y.*samples\\$","",colnames(design))
+# y_fit <- glmQLFit(y, design, robust=TRUE)
+# plotQLDisp(y_fit)
+
+#design matrix
+  
+```
